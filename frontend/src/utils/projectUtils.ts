@@ -36,13 +36,13 @@ export const getFirstPageImage = (project: Project): string | null => {
   if (!project.pages || project.pages.length === 0) {
     return null;
   }
-  
-  // 找到第一页有图片的页面
-  const firstPageWithImage = project.pages.find(p => p.generated_image_path);
-  if (firstPageWithImage?.generated_image_path) {
-    return getImageUrl(firstPageWithImage.generated_image_path, firstPageWithImage.updated_at);
+
+  // 找到第一页有图片的页面，优先使用 generated_image_url（已包含缩略图逻辑）
+  const firstPageWithImage = project.pages.find(p => p.generated_image_url);
+  if (firstPageWithImage?.generated_image_url) {
+    return getImageUrl(firstPageWithImage.generated_image_url, firstPageWithImage.updated_at);
   }
-  
+
   return null;
 };
 
