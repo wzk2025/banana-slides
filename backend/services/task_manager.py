@@ -66,11 +66,11 @@ class TaskManager:
 task_manager = TaskManager(max_workers=4)
 
 
-def save_image_with_version(image, project_id: str, page_id: str, file_service, 
+def save_image_with_version(image, project_id: str, page_id: str, file_service,
                             page_obj=None, image_format: str = 'PNG') -> tuple[str, int]:
     """
     保存图片并创建历史版本记录的公共函数
-    
+
     Args:
         image: PIL Image 对象
         project_id: 项目ID
@@ -78,31 +78,39 @@ def save_image_with_version(image, project_id: str, page_id: str, file_service,
         file_service: FileService 实例
         page_obj: Page 对象（可选，如果提供则更新页面状态）
         image_format: 图片格式，默认 PNG
-    
+
     Returns:
         tuple: (image_path, version_number) - 图片路径和版本号
-    
+
     这个函数会：
     1. 计算下一个版本号（使用 MAX 查询确保安全）
     2. 标记所有旧版本为非当前版本
     3. 保存图片到最终位置
-    4. 创建新版本记录
-    5. 如果提供了 page_obj，更新页面状态和图片路径
+    4. 生成并保存压缩的缓存图片
+    5. 创建新版本记录
+    6. 如果提供了 page_obj，更新页面状态和图片路径
     """
     # 使用 MAX 查询确保版本号安全（即使有版本被删除也不会重复）
     max_version = db.session.query(func.max(PageImageVersion.version_number)).filter_by(page_id=page_id).scalar() or 0
     next_version = max_version + 1
-    
+
     # 批量更新：标记所有旧版本为非当前版本（使用单条 SQL 更高效）
     PageImageVersion.query.filter_by(page_id=page_id).update({'is_current': False})
-    
-    # 保存图片到最终位置（使用版本号）
+
+    # 保存原图到最终位置（使用版本号）
     image_path = file_service.save_generated_image(
         image, project_id, page_id,
         version_number=next_version,
         image_format=image_format
     )
-    
+
+    # 生成并保存压缩的缓存图片（用于前端快速显示）
+    cached_image_path = file_service.save_cached_image(
+        image, project_id, page_id,
+        version_number=next_version,
+        quality=85
+    )
+
     # 创建新版本记录
     new_version = PageImageVersion(
         page_id=page_id,
@@ -111,18 +119,19 @@ def save_image_with_version(image, project_id: str, page_id: str, file_service,
         is_current=True
     )
     db.session.add(new_version)
-    
+
     # 如果提供了 page_obj，更新页面状态和图片路径
     if page_obj:
         page_obj.generated_image_path = image_path
+        page_obj.cached_image_path = cached_image_path
         page_obj.status = 'COMPLETED'
         page_obj.updated_at = datetime.utcnow()
-    
+
     # 提交事务
     db.session.commit()
-    
-    logger.debug(f"Page {page_id} image saved as version {next_version}: {image_path}")
-    
+
+    logger.debug(f"Page {page_id} image saved as version {next_version}: {image_path}, cached: {cached_image_path}")
+
     return image_path, next_version
 
 
@@ -847,16 +856,25 @@ def export_editable_pptx_with_recursive_analysis_task(
         from datetime import datetime
         from PIL import Image
         from models import Project
-        from services.export_service import ExportService
-        
+        from services.export_service import ExportService, ExportError
+
         logger.info(f"开始递归分析导出任务 {task_id} for project {project_id}")
-        
+
         try:
             # Get project
             project = Project.query.get(project_id)
             if not project:
                 raise ValueError(f'Project {project_id} not found')
-            
+
+            # 读取项目的导出设置：是否允许返回半成品
+            export_allow_partial = project.export_allow_partial or False
+            fail_fast = not export_allow_partial
+            logger.info(f"导出设置: export_allow_partial={export_allow_partial}, fail_fast={fail_fast}")
+
+            # IMPORTANT: Expire cached objects to ensure fresh data from database
+            # This prevents reading stale generated_image_path after page regeneration
+            db.session.expire_all()
+
             # Get pages (filtered by page_ids if provided)
             pages = get_filtered_pages(project_id, page_ids)
             if not pages:
@@ -951,9 +969,9 @@ def export_editable_pptx_with_recursive_analysis_task(
             progress_callback("准备", "文字属性提取器已初始化", 5)
             
             # Step 3: 调用导出方法（使用项目的导出设置）
-            logger.info(f"Step 3: 创建可编辑PPTX (extractor={export_extractor_method}, inpaint={export_inpaint_method})...")
+            logger.info(f"Step 3: 创建可编辑PPTX (extractor={export_extractor_method}, inpaint={export_inpaint_method}, fail_fast={fail_fast})...")
             progress_callback("配置", f"提取方法: {export_extractor_method}, 背景修复: {export_inpaint_method}", 6)
-            
+
             _, export_warnings = ExportService.create_editable_pptx_with_recursive_analysis(
                 image_paths=image_paths,
                 output_file=output_path,
@@ -964,7 +982,8 @@ def export_editable_pptx_with_recursive_analysis_task(
                 text_attribute_extractor=text_attribute_extractor,
                 progress_callback=progress_callback,
                 export_extractor_method=export_extractor_method,
-                export_inpaint_method=export_inpaint_method
+                export_inpaint_method=export_inpaint_method,
+                fail_fast=fail_fast
             )
             
             logger.info(f"✓ 可编辑PPTX已创建: {output_path}")
@@ -1002,7 +1021,37 @@ def export_editable_pptx_with_recursive_analysis_task(
                 })
                 db.session.commit()
                 logger.info(f"✓ 任务 {task_id} 完成 - 递归分析导出成功（深度={max_depth}）")
-        
+
+        except ExportError as e:
+            # 导出错误（fail_fast 模式下的详细错误）
+            import traceback
+            error_detail = traceback.format_exc()
+            logger.error(f"✗ 任务 {task_id} 导出失败: {e.message}")
+            logger.error(f"错误类型: {e.error_type}, 详情: {e.details}")
+
+            # 标记任务失败，包含详细错误信息
+            task = Task.query.get(task_id)
+            if task:
+                task.status = 'FAILED'
+                # 构建详细的错误消息
+                error_message = f"{e.message}"
+                if e.help_text:
+                    error_message += f"\n\n💡 {e.help_text}"
+                task.error_message = error_message
+                task.completed_at = datetime.utcnow()
+                # 在 progress 中保存详细错误信息
+                task.set_progress({
+                    "total": 100,
+                    "completed": 0,
+                    "failed": 1,
+                    "current_step": "导出失败",
+                    "percent": 0,
+                    "error_type": e.error_type,
+                    "error_details": e.details,
+                    "help_text": e.help_text
+                })
+                db.session.commit()
+
         except Exception as e:
             import traceback
             error_detail = traceback.format_exc()

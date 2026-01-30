@@ -22,7 +22,7 @@ import {
   FileText,
   Loader2,
 } from 'lucide-react';
-import { Button, Loading, Modal, Textarea, useToast, useConfirm, MaterialSelector, Markdown, ProjectSettingsModal, ExportTasksPanel } from '@/components/shared';
+import { Button, Loading, Modal, Textarea, useToast, useConfirm, MaterialSelector, ProjectSettingsModal, ExportTasksPanel } from '@/components/shared';
 import { MaterialGeneratorModal } from '@/components/shared/MaterialGeneratorModal';
 import { TemplateSelector, getTemplateFile } from '@/components/shared/TemplateSelector';
 import { listUserTemplates, type UserTemplate } from '@/api/endpoints';
@@ -32,8 +32,8 @@ import { SlideCard } from '@/components/preview/SlideCard';
 import { useProjectStore } from '@/store/useProjectStore';
 import { useExportTasksStore, type ExportTaskType } from '@/store/useExportTasksStore';
 import { getImageUrl } from '@/api/client';
-import { getPageImageVersions, setCurrentImageVersion, updateProject, uploadTemplate, exportPPTX as apiExportPPTX, exportPDF as apiExportPDF, exportEditablePPTX as apiExportEditablePPTX } from '@/api/endpoints';
-import type { ImageVersion, DescriptionContent, ExportExtractorMethod, ExportInpaintMethod } from '@/types';
+import { getPageImageVersions, setCurrentImageVersion, updateProject, uploadTemplate, exportPPTX as apiExportPPTX, exportPDF as apiExportPDF, exportEditablePPTX as apiExportEditablePPTX, getSettings } from '@/api/endpoints';
+import type { ImageVersion, DescriptionContent, ExportExtractorMethod, ExportInpaintMethod, Page } from '@/types';
 import { normalizeErrorMessage } from '@/utils';
 
 export const SlidePreview: React.FC = () => {
@@ -47,6 +47,7 @@ export const SlidePreview: React.FC = () => {
     generateImages,
     editPageImage,
     deletePageById,
+    updatePageLocal,
     isGlobalLoading,
     taskProgress,
     pageGeneratingTasks,
@@ -63,6 +64,10 @@ export const SlidePreview: React.FC = () => {
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
   const [editPrompt, setEditPrompt] = useState('');
+  // 大纲和描述编辑状态
+  const [editOutlineTitle, setEditOutlineTitle] = useState('');
+  const [editOutlinePoints, setEditOutlinePoints] = useState('');
+  const [editDescription, setEditDescription] = useState('');
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showExportTasksPanel, setShowExportTasksPanel] = useState(false);
   // 多选导出相关状态
@@ -105,7 +110,14 @@ export const SlidePreview: React.FC = () => {
   const [exportInpaintMethod, setExportInpaintMethod] = useState<ExportInpaintMethod>(
     (currentProject?.export_inpaint_method as ExportInpaintMethod) || 'hybrid'
   );
+  const [exportAllowPartial, setExportAllowPartial] = useState<boolean>(
+    currentProject?.export_allow_partial || false
+  );
   const [isSavingExportSettings, setIsSavingExportSettings] = useState(false);
+  // 1K分辨率警告对话框状态
+  const [show1KWarningDialog, setShow1KWarningDialog] = useState(false);
+  const [skip1KWarningChecked, setSkip1KWarningChecked] = useState(false);
+  const [pending1KAction, setPending1KAction] = useState<(() => Promise<void>) | null>(null);
   // 每页编辑参数缓存（前端会话内缓存，便于重复执行）
   const [editContextByPage, setEditContextByPage] = useState<Record<string, {
     prompt: string;
@@ -165,6 +177,7 @@ export const SlidePreview: React.FC = () => {
         // 初始化导出设置
         setExportExtractorMethod((currentProject.export_extractor_method as ExportExtractorMethod) || 'hybrid');
         setExportInpaintMethod((currentProject.export_inpaint_method as ExportInpaintMethod) || 'hybrid');
+        setExportAllowPartial(currentProject.export_allow_partial || false);
         lastProjectId.current = currentProject.id || null;
         isEditingRequirements.current = false;
         isEditingTemplateStyle.current = false;
@@ -211,78 +224,171 @@ export const SlidePreview: React.FC = () => {
     loadVersions();
   }, [currentProject, selectedIndex, projectId]);
 
-  const handleGenerateAll = async () => {
-    const pageIds = getSelectedPageIdsForExport();
-    const isPartialGenerate = isMultiSelectMode && selectedPageIds.size > 0;
-    
-    // 检查要生成的页面中是否有已有图片的
-    const pagesToGenerate = isPartialGenerate
-      ? currentProject?.pages.filter(p => p.id && selectedPageIds.has(p.id))
-      : currentProject?.pages;
-    const hasImages = pagesToGenerate?.some((p) => p.generated_image_path);
-    
-    const executeGenerate = async () => {
-      await generateImages(pageIds);
-    };
-    
-    if (hasImages) {
-      const message = isPartialGenerate
-        ? `将重新生成选中的 ${selectedPageIds.size} 页（历史记录将会保存），确定继续吗？`
-        : '将重新生成所有页面（历史记录将会保存），确定继续吗？';
-      confirm(
-        message,
-        executeGenerate,
-        { title: '确认重新生成', variant: 'warning' }
-      );
-    } else {
-      await executeGenerate();
+  // 检查是否需要显示1K分辨率警告
+  const checkResolutionAndExecute = useCallback(async (action: () => Promise<void>) => {
+    // 检查 localStorage 中是否已跳过警告
+    const skipWarning = localStorage.getItem('skip1KResolutionWarning') === 'true';
+    if (skipWarning) {
+      await action();
+      return;
     }
+
+    try {
+      const response = await getSettings();
+      const resolution = response.data?.image_resolution;
+
+      // 如果是1K分辨率，显示警告对话框
+      if (resolution === '1K') {
+        setPending1KAction(() => action);
+        setSkip1KWarningChecked(false);
+        setShow1KWarningDialog(true);
+      } else {
+        // 不是1K分辨率，直接执行
+        await action();
+      }
+    } catch (error) {
+      console.error('获取设置失败:', error);
+      // 获取设置失败时，直接执行（不阻塞用户）
+      await action();
+    }
+  }, []);
+
+  // 确认1K分辨率警告后执行
+  const handleConfirm1KWarning = useCallback(async () => {
+    // 如果勾选了"不再提示"，保存到 localStorage
+    if (skip1KWarningChecked) {
+      localStorage.setItem('skip1KResolutionWarning', 'true');
+    }
+
+    setShow1KWarningDialog(false);
+
+    // 执行待处理的操作
+    if (pending1KAction) {
+      await pending1KAction();
+      setPending1KAction(null);
+    }
+  }, [skip1KWarningChecked, pending1KAction]);
+
+  // 取消1K分辨率警告
+  const handleCancel1KWarning = useCallback(() => {
+    setShow1KWarningDialog(false);
+    setPending1KAction(null);
+  }, []);
+
+  const handleGenerateAll = async () => {
+    // 先检查分辨率，如果是1K则显示警告
+    await checkResolutionAndExecute(async () => {
+      const pageIds = getSelectedPageIdsForExport();
+      const isPartialGenerate = isMultiSelectMode && selectedPageIds.size > 0;
+
+      // 检查要生成的页面中是否有已有图片的
+      const pagesToGenerate = isPartialGenerate
+        ? currentProject?.pages.filter(p => p.id && selectedPageIds.has(p.id))
+        : currentProject?.pages;
+      const hasImages = pagesToGenerate?.some((p) => p.generated_image_path);
+
+      const executeGenerate = async () => {
+        try {
+          await generateImages(pageIds);
+        } catch (error: any) {
+          console.error('批量生成错误:', error);
+          console.error('错误响应:', error?.response?.data);
+
+          // 提取后端返回的更具体错误信息
+          let errorMessage = '生成失败';
+          const respData = error?.response?.data;
+
+          if (respData) {
+            if (respData.error?.message) {
+              errorMessage = respData.error.message;
+            } else if (respData.message) {
+              errorMessage = respData.message;
+            } else if (respData.error) {
+              errorMessage =
+                typeof respData.error === 'string'
+                  ? respData.error
+                  : respData.error.message || errorMessage;
+            }
+          } else if (error.message) {
+            errorMessage = error.message;
+          }
+
+          console.log('提取的错误消息:', errorMessage);
+
+          // 使用统一的错误消息规范化函数
+          errorMessage = normalizeErrorMessage(errorMessage);
+
+          console.log('规范化后的错误消息:', errorMessage);
+
+          show({
+            message: errorMessage,
+            type: 'error',
+          });
+        }
+      };
+
+      if (hasImages) {
+        const message = isPartialGenerate
+          ? `将重新生成选中的 ${selectedPageIds.size} 页（历史记录将会保存），确定继续吗？`
+          : '将重新生成所有页面（历史记录将会保存），确定继续吗？';
+        confirm(
+          message,
+          executeGenerate,
+          { title: '确认重新生成', variant: 'warning' }
+        );
+      } else {
+        await executeGenerate();
+      }
+    });
   };
 
   const handleRegeneratePage = useCallback(async () => {
     if (!currentProject) return;
     const page = currentProject.pages[selectedIndex];
     if (!page.id) return;
-    
+
     // 如果该页面正在生成，不重复提交
     if (pageGeneratingTasks[page.id]) {
       show({ message: '该页面正在生成中，请稍候...', type: 'info' });
       return;
     }
-    
-    try {
-      // 使用统一的 generateImages，传入单个页面 ID
-      await generateImages([page.id]);
-      show({ message: '已开始生成图片，请稍候...', type: 'success' });
-    } catch (error: any) {
-      // 提取后端返回的更具体错误信息
-      let errorMessage = '生成失败';
-      const respData = error?.response?.data;
 
-      if (respData) {
-        if (respData.error?.message) {
-          errorMessage = respData.error.message;
-        } else if (respData.message) {
-          errorMessage = respData.message;
-        } else if (respData.error) {
-          errorMessage =
-            typeof respData.error === 'string'
-              ? respData.error
-              : respData.error.message || errorMessage;
+    // 先检查分辨率，如果是1K则显示警告
+    await checkResolutionAndExecute(async () => {
+      try {
+        // 使用统一的 generateImages，传入单个页面 ID
+        await generateImages([page.id!]);
+        show({ message: '已开始生成图片，请稍候...', type: 'success' });
+      } catch (error: any) {
+        // 提取后端返回的更具体错误信息
+        let errorMessage = '生成失败';
+        const respData = error?.response?.data;
+
+        if (respData) {
+          if (respData.error?.message) {
+            errorMessage = respData.error.message;
+          } else if (respData.message) {
+            errorMessage = respData.message;
+          } else if (respData.error) {
+            errorMessage =
+              typeof respData.error === 'string'
+                ? respData.error
+                : respData.error.message || errorMessage;
+          }
+        } else if (error.message) {
+          errorMessage = error.message;
         }
-      } else if (error.message) {
-        errorMessage = error.message;
+
+        // 使用统一的错误消息规范化函数
+        errorMessage = normalizeErrorMessage(errorMessage);
+
+        show({
+          message: errorMessage,
+          type: 'error',
+        });
       }
-
-      // 使用统一的错误消息规范化函数
-      errorMessage = normalizeErrorMessage(errorMessage);
-
-      show({
-        message: errorMessage,
-        type: 'error',
-      });
-    }
-  }, [currentProject, selectedIndex, pageGeneratingTasks, generateImages, show]);
+    });
+  }, [currentProject, selectedIndex, pageGeneratingTasks, generateImages, show, checkResolutionAndExecute]);
 
   const handleSwitchVersion = async (versionId: string) => {
     if (!currentProject || !selectedPage?.id || !projectId) return;
@@ -338,6 +444,21 @@ export const SlidePreview: React.FC = () => {
     setIsOutlineExpanded(false);
     setIsDescriptionExpanded(false);
 
+    // 初始化大纲和描述编辑状态
+    setEditOutlineTitle(page?.outline_content?.title || '');
+    setEditOutlinePoints(page?.outline_content?.points?.join('\n') || '');
+    // 提取描述文本
+    const descContent = page?.description_content;
+    let descText = '';
+    if (descContent) {
+      if ('text' in descContent) {
+        descText = descContent.text as string;
+      } else if ('text_content' in descContent && Array.isArray(descContent.text_content)) {
+        descText = descContent.text_content.join('\n');
+      }
+    }
+    setEditDescription(descText);
+
     if (pageId && editContextByPage[pageId]) {
       // 恢复该页上次编辑的内容和图片选择
       const cached = editContextByPage[pageId];
@@ -366,11 +487,55 @@ export const SlidePreview: React.FC = () => {
     setIsEditModalOpen(true);
   };
 
+  // 保存大纲和描述修改
+  const handleSaveOutlineAndDescription = useCallback(() => {
+    if (!currentProject) return;
+    const page = currentProject.pages[selectedIndex];
+    if (!page?.id) return;
+
+    const updates: Partial<Page> = {};
+    
+    // 检查大纲是否有变化
+    const originalTitle = page.outline_content?.title || '';
+    const originalPoints = page.outline_content?.points?.join('\n') || '';
+    if (editOutlineTitle !== originalTitle || editOutlinePoints !== originalPoints) {
+      updates.outline_content = {
+        title: editOutlineTitle,
+        points: editOutlinePoints.split('\n').filter((p) => p.trim()),
+      };
+    }
+    
+    // 检查描述是否有变化
+    const descContent = page.description_content;
+    let originalDesc = '';
+    if (descContent) {
+      if ('text' in descContent) {
+        originalDesc = descContent.text as string;
+      } else if ('text_content' in descContent && Array.isArray(descContent.text_content)) {
+        originalDesc = descContent.text_content.join('\n');
+      }
+    }
+    if (editDescription !== originalDesc) {
+      updates.description_content = {
+        text: editDescription,
+      } as DescriptionContent;
+    }
+    
+    // 如果有修改，保存更新
+    if (Object.keys(updates).length > 0) {
+      updatePageLocal(page.id, updates);
+      show({ message: '大纲和描述已保存', type: 'success' });
+    }
+  }, [currentProject, selectedIndex, editOutlineTitle, editOutlinePoints, editDescription, updatePageLocal, show]);
+
   const handleSubmitEdit = useCallback(async () => {
     if (!currentProject || !editPrompt.trim()) return;
     
     const page = currentProject.pages[selectedIndex];
     if (!page.id) return;
+
+    // 先保存大纲和描述的修改
+    handleSaveOutlineAndDescription();
 
     // 调用后端编辑接口
     await editPageImage(
@@ -399,7 +564,7 @@ export const SlidePreview: React.FC = () => {
     }));
 
     setIsEditModalOpen(false);
-  }, [currentProject, selectedIndex, editPrompt, selectedContextImages, editPageImage]);
+  }, [currentProject, selectedIndex, editPrompt, selectedContextImages, editPageImage, handleSaveOutlineAndDescription]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -742,25 +907,26 @@ export const SlidePreview: React.FC = () => {
 
   const handleSaveExportSettings = useCallback(async () => {
     if (!currentProject || !projectId) return;
-    
+
     setIsSavingExportSettings(true);
     try {
-      await updateProject(projectId, { 
+      await updateProject(projectId, {
         export_extractor_method: exportExtractorMethod,
-        export_inpaint_method: exportInpaintMethod 
+        export_inpaint_method: exportInpaintMethod,
+        export_allow_partial: exportAllowPartial
       });
       // 更新本地项目状态
       await syncProject(projectId);
       show({ message: '导出设置已保存', type: 'success' });
     } catch (error: any) {
-      show({ 
-        message: `保存失败: ${error.message || '未知错误'}`, 
-        type: 'error' 
+      show({
+        message: `保存失败: ${error.message || '未知错误'}`,
+        type: 'error'
       });
     } finally {
       setIsSavingExportSettings(false);
     }
-  }, [currentProject, projectId, exportExtractorMethod, exportInpaintMethod, syncProject, show]);
+  }, [currentProject, projectId, exportExtractorMethod, exportInpaintMethod, exportAllowPartial, syncProject, show]);
 
   const handleTemplateSelect = async (templateFile: File | null, templateId?: string) => {
     if (!projectId) return;
@@ -1191,7 +1357,7 @@ export const SlidePreview: React.FC = () => {
                       <img
                         src={imageUrl}
                         alt={`Slide ${selectedIndex + 1}`}
-                        className="w-full h-full object-contain select-none"
+                        className="w-full h-full object-cover select-none"
                         draggable={false}
                       />
                     ) : (
@@ -1421,70 +1587,70 @@ export const SlidePreview: React.FC = () => {
             )}
           </div>
 
-          {/* 大纲内容 - 可折叠 */}
-          {selectedPage?.outline_content && (
-            <div className="bg-gray-50 rounded-lg border border-gray-200">
-              <button
-                onClick={() => setIsOutlineExpanded(!isOutlineExpanded)}
-                className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-100 transition-colors"
-              >
-                <h4 className="text-sm font-semibold text-gray-700">页面大纲</h4>
-                {isOutlineExpanded ? (
-                  <ChevronUp size={18} className="text-gray-500" />
-                ) : (
-                  <ChevronDown size={18} className="text-gray-500" />
-                )}
-              </button>
-              {isOutlineExpanded && (
-                <div className="px-4 pb-4 space-y-2">
-                  <div className="text-sm font-medium text-gray-900 mb-2">
-                    {selectedPage.outline_content.title}
-                  </div>
-                  {selectedPage.outline_content.points && selectedPage.outline_content.points.length > 0 && (
-                    <div className="text-sm text-gray-600">
-                      <Markdown>{selectedPage.outline_content.points.join('\n')}</Markdown>
-                    </div>
-                  )}
-                </div>
+          {/* 大纲内容 - 可编辑 */}
+          <div className="bg-gray-50 rounded-lg border border-gray-200">
+            <button
+              onClick={() => setIsOutlineExpanded(!isOutlineExpanded)}
+              className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-100 transition-colors"
+            >
+              <h4 className="text-sm font-semibold text-gray-700">页面大纲（可编辑）</h4>
+              {isOutlineExpanded ? (
+                <ChevronUp size={18} className="text-gray-500" />
+              ) : (
+                <ChevronDown size={18} className="text-gray-500" />
               )}
-            </div>
-          )}
+            </button>
+            {isOutlineExpanded && (
+              <div className="px-4 pb-4 space-y-3">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">标题</label>
+                  <input
+                    type="text"
+                    value={editOutlineTitle}
+                    onChange={(e) => setEditOutlineTitle(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-banana-500"
+                    placeholder="输入页面标题"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">要点（每行一个）</label>
+                  <textarea
+                    value={editOutlinePoints}
+                    onChange={(e) => setEditOutlinePoints(e.target.value)}
+                    rows={4}
+                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-banana-500 resize-none"
+                    placeholder="每行输入一个要点"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
 
-          {/* 描述内容 - 可折叠 */}
-          {selectedPage?.description_content && (
-            <div className="bg-blue-50 rounded-lg border border-blue-200">
-              <button
-                onClick={() => setIsDescriptionExpanded(!isDescriptionExpanded)}
-                className="w-full px-4 py-3 flex items-center justify-between hover:bg-blue-100 transition-colors"
-              >
-                <h4 className="text-sm font-semibold text-gray-700">页面描述</h4>
-                {isDescriptionExpanded ? (
-                  <ChevronUp size={18} className="text-gray-500" />
-                ) : (
-                  <ChevronDown size={18} className="text-gray-500" />
-                )}
-              </button>
-              {isDescriptionExpanded && (
-                <div className="px-4 pb-4">
-                  <div className="text-sm text-gray-700 max-h-48 overflow-y-auto">
-                    <Markdown>
-                      {(() => {
-                        const desc = selectedPage.description_content;
-                        if (!desc) return '暂无描述';
-                        // 处理两种格式
-                        if ('text' in desc) {
-                          return desc.text;
-                        } else if ('text_content' in desc && Array.isArray(desc.text_content)) {
-                          return desc.text_content.join('\n');
-                        }
-                        return '暂无描述';
-                      })() as string}
-                    </Markdown>
-                  </div>
-                </div>
+          {/* 描述内容 - 可编辑 */}
+          <div className="bg-blue-50 rounded-lg border border-blue-200">
+            <button
+              onClick={() => setIsDescriptionExpanded(!isDescriptionExpanded)}
+              className="w-full px-4 py-3 flex items-center justify-between hover:bg-blue-100 transition-colors"
+            >
+              <h4 className="text-sm font-semibold text-gray-700">页面描述（可编辑）</h4>
+              {isDescriptionExpanded ? (
+                <ChevronUp size={18} className="text-gray-500" />
+              ) : (
+                <ChevronDown size={18} className="text-gray-500" />
               )}
-            </div>
-          )}
+            </button>
+            {isDescriptionExpanded && (
+              <div className="px-4 pb-4">
+                <textarea
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                  rows={8}
+                  className="w-full px-3 py-2 text-sm border border-blue-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-banana-500 resize-none"
+                  placeholder="输入页面的详细描述内容"
+                />
+              </div>
+            )}
+          </div>
 
           {/* 上下文图片选择 */}
           <div className="bg-gray-50 rounded-lg border border-gray-200 p-4 space-y-4">
@@ -1617,17 +1783,28 @@ export const SlidePreview: React.FC = () => {
             onChange={(e) => setEditPrompt(e.target.value)}
             rows={4}
           />
-          <div className="flex justify-end gap-3">
-            <Button variant="ghost" onClick={() => setIsEditModalOpen(false)}>
-              取消
-            </Button>
-            <Button
-              variant="primary"
-              onClick={handleSubmitEdit}
-              disabled={!editPrompt.trim()}
+          <div className="flex justify-between gap-3">
+            <Button 
+              variant="secondary" 
+              onClick={() => {
+                handleSaveOutlineAndDescription();
+                setIsEditModalOpen(false);
+              }}
             >
-              生成
+              仅保存大纲/描述
             </Button>
+            <div className="flex gap-3">
+              <Button variant="ghost" onClick={() => setIsEditModalOpen(false)}>
+                取消
+              </Button>
+              <Button
+                variant="primary"
+                onClick={handleSubmitEdit}
+                disabled={!editPrompt.trim()}
+              >
+                生成图片
+              </Button>
+            </div>
           </div>
         </div>
       </Modal>
@@ -1705,14 +1882,57 @@ export const SlidePreview: React.FC = () => {
             // 导出设置
             exportExtractorMethod={exportExtractorMethod}
             exportInpaintMethod={exportInpaintMethod}
+            exportAllowPartial={exportAllowPartial}
             onExportExtractorMethodChange={setExportExtractorMethod}
             onExportInpaintMethodChange={setExportInpaintMethod}
+            onExportAllowPartialChange={setExportAllowPartial}
             onSaveExportSettings={handleSaveExportSettings}
             isSavingExportSettings={isSavingExportSettings}
           />
         </>
       )}
-      
+
+      {/* 1K分辨率警告对话框 */}
+      <Modal
+        isOpen={show1KWarningDialog}
+        onClose={handleCancel1KWarning}
+        title="1K分辨率警告"
+        size="sm"
+      >
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+            <div className="text-2xl">⚠️</div>
+            <div className="flex-1">
+              <p className="text-sm text-amber-800">
+                当前使用 <strong>1K 分辨率</strong> 生成图片，可能导致渲染的文字乱码或模糊。
+              </p>
+              <p className="text-sm text-amber-700 mt-2">
+                建议在「项目设置 → 全局设置」中切换到 <strong>2K</strong> 或 <strong>4K</strong> 分辨率以获得更清晰的效果。
+              </p>
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={skip1KWarningChecked}
+              onChange={(e) => setSkip1KWarningChecked(e.target.checked)}
+              className="w-4 h-4 text-banana-600 rounded focus:ring-banana-500"
+            />
+            <span className="text-sm text-gray-600">不再提示</span>
+          </label>
+
+          <div className="flex justify-end gap-3 pt-2">
+            <Button variant="ghost" onClick={handleCancel1KWarning}>
+              取消
+            </Button>
+            <Button variant="primary" onClick={handleConfirm1KWarning}>
+              仍然生成
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
     </div>
   );
 };
