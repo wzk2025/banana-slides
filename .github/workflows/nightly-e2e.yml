@@ -13,17 +13,17 @@ name: Nightly Full E2E Tests
 # - 需要前端和后端都运行
 # - 不适合在PR阶段运行
 
-on:
-  schedule:
-    # 每天UTC 2:00运行（北京时间10:00）
-    - cron: '0 2 * * *'
-  workflow_dispatch:  # 允许手动触发
-    inputs:
-      skip_ui_e2e:
-        description: 'Skip UI-driven E2E tests'
-        required: false
-        default: 'false'
-        type: boolean
+# on:
+#   schedule:
+#     # 每天UTC 2:00运行（北京时间10:00）
+#     - cron: '0 2 * * *'
+#   workflow_dispatch:  # 允许手动触发
+#     inputs:
+#       skip_ui_e2e:
+#         description: 'Skip UI-driven E2E tests'
+#         required: false
+#         default: 'false'
+#         type: boolean
 
 jobs:
   true-e2e-test:
